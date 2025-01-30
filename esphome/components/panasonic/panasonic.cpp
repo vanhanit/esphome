@@ -26,7 +26,9 @@ const uint8_t PANASONIC_BYTE09 = 0X20;
 const uint8_t PANASONIC_BYTE10 = 0Xe0;
 const uint8_t PANASONIC_BYTE11 = 0X04;
 const uint8_t PANASONIC_BYTE15 = 0X80;
-const uint8_t PANASONIC_BYTE23 = 0X89;
+const uint8_t PANASONIC_BYTE19 = 0X08;
+const uint8_t PANASONIC_BYTE20 = 0X80;
+const uint8_t PANASONIC_BYTE23 = 0X80;
 
 climate::ClimateTraits PanasonicClimate::traits() {
   auto traits = climate::ClimateTraits();
@@ -80,14 +82,15 @@ void PanasonicClimate::transmit_state() {
   // | 9     | Constant: 0x20                                                     |
   // | 10    | Constant: 0xe0                                                     |
   // | 11    | Constant: 0x04                                                     |
-  // | 13    | on:1 | timer_on:1 | timer_off:1 | reserved:1 | mode:3 | reserved:1 |
-  // | 14    | reserved:1 | temperature:4 | normal_mode:1 | reserved:2            |
+  // | 13    | reserved:1 | mode:3 | reserved:1 | timer_off:1 | timer_on:1 | on:1 |
+  // | 14    | reserved:2 | normal_mode:1 | temperature:4 | reserved:1            |
   // | 15    | Constant: 0x80                                                     |
-  // | 16    | swing_vertical:4 | fan_speed:4                                     |
-  // | 17    | swing_horizontal:4 | reserved:4                                    |
-  // | 18-20 | timer_minute_on:11 | reserved:1 | timer_minute_off:11 | reserved:1 |
-  // | 21-23 | reserved: 0x00                                                     |
-  // | 24-25 | time:11 | reserved:5                                               |
+  // | 16    | fan_speed:4 | swing_vertical:4                                     |
+  // | 17    | reserved:4 | swing_horizontal:4                                    |
+  // | 18-20 | reserved:1 | timer_minute_off:11 | reserved:1 | timer_minute_on:11 |
+  // | 21-22 | reserved: 0x00                                                     |
+  // | 23    | Constant: 0x80                                                     |
+  // | 24-25 | reserved:5 | time:11                                               |
   // | 26    | Checksum: SUM[8..25]                                               |
   // ------------------------------------------------------------------------------
 
@@ -110,8 +113,8 @@ void PanasonicClimate::transmit_state() {
                               0x00,
                               0x00,
                               0x00,
-                              0x00,
-                              0x00,
+                              PANASONIC_BYTE19,
+                              PANASONIC_BYTE20,
                               0x00,
                               0x00,
                               PANASONIC_BYTE23,
@@ -119,64 +122,64 @@ void PanasonicClimate::transmit_state() {
                               0x00,
                               0x00};
 
-  remote_state[13] = 0x80;  // Default on
+  remote_state[13] = 0x01;  // Default on
   switch (this->mode) {
     case climate::CLIMATE_MODE_HEAT:
-      remote_state[13] |= Mode::HEAT << 1;
+      remote_state[13] |= Mode::HEAT << 4;
       break;
     case climate::CLIMATE_MODE_DRY:
-      remote_state[13] |= Mode::DRY << 1;
+      remote_state[13] |= Mode::DRY << 4;
       break;
     case climate::CLIMATE_MODE_COOL:
-      remote_state[13] |= Mode::COOL << 1;
+      remote_state[13] |= Mode::COOL << 4;
       break;
     case climate::CLIMATE_MODE_HEAT_COOL:
-      remote_state[13] |= Mode::AUTO << 1;
+      remote_state[13] |= Mode::AUTO << 4;
       break;
     case climate::CLIMATE_MODE_FAN_ONLY:
-      remote_state[13] |= Mode::FAN << 1;
+      remote_state[13] |= Mode::FAN << 4;
       break;
     case climate::CLIMATE_MODE_OFF:
       remote_state[13] = 0x00;  // Off
     default:
       if (this->supports_heat_) {
-        remote_state[13] |= Mode::HEAT << 1;
+        remote_state[13] |= Mode::HEAT << 4;
       } else {
-        remote_state[13] |= Mode::COOL << 1;
+        remote_state[13] |= Mode::COOL << 4;
       }
       break;
   }
-  remote_state[13] |= 1 << 4;
+  remote_state[13] |= 1 << 3;
 
   // Temperature
   if (this->mode == climate::CLIMATE_MODE_DRY) {
-    remote_state[14] = ((24 - PANASONIC_TEMP_MIN) & 0x0f) << 3;
+    remote_state[14] = ((24 - PANASONIC_TEMP_MIN) & 0x0f) << 1;
   } else {
     remote_state[14] =
         ((uint8_t) roundf(clamp<float>(this->target_temperature, PANASONIC_TEMP_MIN, PANASONIC_TEMP_MAX) -
                           PANASONIC_TEMP_MIN))
-        << 3;
+        << 1;
   }
-  remote_state[14] |= 1 << 2;  // Normal mode
+  remote_state[14] |= 1 << 5;  // Normal mode
 
   // Swing
   switch (this->swing_mode) {
     case climate::CLIMATE_SWING_HORIZONTAL:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_DOWN << 4;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_AUTO << 4;
+      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_DOWN;
+      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_AUTO;
       break;
     case climate::CLIMATE_SWING_VERTICAL:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_AUTO << 4;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_MIDDLE << 4;
+      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_AUTO;
+      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_MIDDLE;
       break;
     case climate::CLIMATE_SWING_BOTH:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_AUTO << 4;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_AUTO << 4;
+      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_AUTO;
+      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_AUTO;
       break;
     case climate::CLIMATE_SWING_OFF:
     default:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_DOWN << 4;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_MIDDLE << 4;
+      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_DOWN;
+      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_MIDDLE;
       break;
   }
 
@@ -186,22 +189,22 @@ void PanasonicClimate::transmit_state() {
   // Fan Speed
   switch (this->fan_mode.value()) {
     case climate::CLIMATE_FAN_QUIET:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_LOWEST;
+      remote_state[16] |= SetFanMode::PANASONIC_FAN_LOWEST << 4;
       break;
     case climate::CLIMATE_FAN_LOW:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_LOW;
+      remote_state[16] |= SetFanMode::PANASONIC_FAN_LOW << 4;
       break;
     case climate::CLIMATE_FAN_MEDIUM:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_MEDIUM;
+      remote_state[16] |= SetFanMode::PANASONIC_FAN_MEDIUM << 4;
       break;
     case climate::CLIMATE_FAN_MIDDLE:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_HIGH;
+      remote_state[16] |= SetFanMode::PANASONIC_FAN_HIGH << 4;
       break;
     case climate::CLIMATE_FAN_HIGH:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_HIGHEST;
+      remote_state[16] |= SetFanMode::PANASONIC_FAN_HIGHEST << 4;
       break;
     default:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_AUTO;
+      remote_state[16] |= SetFanMode::PANASONIC_FAN_AUTO << 4;
       break;
   }
 
