@@ -26,6 +26,7 @@ const uint8_t PANASONIC_BYTE09 = 0X20;
 const uint8_t PANASONIC_BYTE10 = 0Xe0;
 const uint8_t PANASONIC_BYTE11 = 0X04;
 const uint8_t PANASONIC_BYTE15 = 0X80;
+const uint8_t PANASONIC_BYTE23 = 0X89;
 
 climate::ClimateTraits PanasonicClimate::traits() {
   auto traits = climate::ClimateTraits();
@@ -113,7 +114,7 @@ void PanasonicClimate::transmit_state() {
                               0x00,
                               0x00,
                               0x00,
-                              0x00,
+                              PANASONIC_BYTE23,
                               0x00,
                               0x00,
                               0x00};
@@ -145,6 +146,7 @@ void PanasonicClimate::transmit_state() {
       }
       break;
   }
+  remote_state[13] |= 1 << 4;
 
   // Temperature
   if (this->mode == climate::CLIMATE_MODE_DRY) {
