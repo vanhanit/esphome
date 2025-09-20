@@ -61,8 +61,7 @@ CONFIG_SCHEMA = climate_ir.climate_ir_with_receiver_schema(PanasonicClimate).ext
 
 
 async def to_code(config):
-    var = cg.new_Pvariable(config[CONF_ID])
-    await climate_ir.register_climate_ir(var, config)
+    var = await climate_ir.new_climate_ir(config)
 
     cg.add(var.set_fan_mode(config[CONF_SET_FAN_MODE]))
     cg.add(var.set_supports_dry(config[CONF_SUPPORTS_DRY]))
