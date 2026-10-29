@@ -1,394 +1,291 @@
 #include "panasonic.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
-namespace esphome {
-namespace panasonic {
+#include <cmath>
+#include <cstring>
 
-static const char *const TAG = "panasonic.climate";
+namespace esphome::panasonic {
+
+ESPHOME_LOG_TAG(TAG, "panasonic.climate");
+
+// A command is two frames: an 8 byte preamble frame, a gap, then the 19 byte state frame.
+static constexpr size_t PANASONIC_FRAME1_SIZE = 8;
+static constexpr size_t PANASONIC_FRAME2_SIZE = 19;
+static constexpr size_t PANASONIC_STATE_SIZE = PANASONIC_FRAME1_SIZE + PANASONIC_FRAME2_SIZE;
 
 // Pulse parameters in usec
-const uint16_t PANASONIC_BIT_MARK = 400;
-const uint16_t PANASONIC_END_MARK = 550;
-const uint16_t PANASONIC_ONE_SPACE = 1350;
-const uint16_t PANASONIC_ZERO_SPACE = 430;
-const uint16_t PANASONIC_HEADER_MARK = 3500;
-const uint16_t PANASONIC_HEADER_SPACE = 1700;
-const uint16_t PANASONIC_MIN_GAP = 10000;
+static constexpr uint16_t PANASONIC_HEADER_MARK = 3500;
+static constexpr uint16_t PANASONIC_HEADER_SPACE = 1700;
+static constexpr uint16_t PANASONIC_BIT_MARK = 400;
+static constexpr uint16_t PANASONIC_END_MARK = 550;
+static constexpr uint16_t PANASONIC_MIN_GAP = 10000;
+static constexpr remote_base::BitTimings PANASONIC_BIT_TIMINGS{
+    .bit_mark = PANASONIC_BIT_MARK, .one_space = 1350, .zero_space = 430};
 
-// Marker bytes
-const uint8_t PANASONIC_BYTE00 = 0X02;
-const uint8_t PANASONIC_BYTE01 = 0X20;
-const uint8_t PANASONIC_BYTE02 = 0Xe0;
-const uint8_t PANASONIC_BYTE03 = 0X04;
-const uint8_t PANASONIC_BYTE07 = 0X06;
-const uint8_t PANASONIC_BYTE08 = 0X02;
-const uint8_t PANASONIC_BYTE09 = 0X20;
-const uint8_t PANASONIC_BYTE10 = 0Xe0;
-const uint8_t PANASONIC_BYTE11 = 0X04;
-const uint8_t PANASONIC_BYTE15 = 0X80;
-const uint8_t PANASONIC_BYTE19 = 0X08;
-const uint8_t PANASONIC_BYTE20 = 0X80;
-const uint8_t PANASONIC_BYTE23 = 0X80;
+// Byte 13: power and mode
+static constexpr uint8_t PANASONIC_POWER_ON = 0x01;
+static constexpr uint8_t PANASONIC_BYTE13_CONSTANT = 0x08;
+static constexpr uint8_t PANASONIC_MODE_SHIFT = 4;
+static constexpr uint8_t PANASONIC_MODE_MASK = 0x07;
+static constexpr uint8_t PANASONIC_MODE_AUTO = 0x00;
+static constexpr uint8_t PANASONIC_MODE_DRY = 0x02;
+static constexpr uint8_t PANASONIC_MODE_COOL = 0x03;
+static constexpr uint8_t PANASONIC_MODE_HEAT = 0x04;
+static constexpr uint8_t PANASONIC_MODE_FAN_ONLY = 0x06;
 
-climate::ClimateTraits PanasonicClimate::traits() {
-  auto traits = climate::ClimateTraits();
-  traits.set_supports_current_temperature(this->sensor_ != nullptr);
-  traits.set_supports_action(false);
-  traits.set_visual_min_temperature(PANASONIC_TEMP_MIN);
-  traits.set_visual_max_temperature(PANASONIC_TEMP_MAX);
-  traits.set_visual_temperature_step(1.0f);
-  traits.set_supported_modes({climate::CLIMATE_MODE_OFF});
+// Byte 14: target temperature in whole degrees Celsius, bits 1-5
+static constexpr uint8_t PANASONIC_TEMP_SHIFT = 1;
+static constexpr uint8_t PANASONIC_TEMP_MASK = 0x1F;
+// The unit is sent this temperature in dry mode
+static constexpr uint8_t PANASONIC_DRY_TEMP = 24;
 
-  if (this->supports_cool_)
-    traits.add_supported_mode(climate::CLIMATE_MODE_COOL);
-  if (this->supports_heat_)
-    traits.add_supported_mode(climate::CLIMATE_MODE_HEAT);
+// Byte 16: fan speed (high nibble) and vertical vane (low nibble)
+static constexpr uint8_t PANASONIC_FAN_AUTO = 0x0A;
+static constexpr uint8_t PANASONIC_FAN_SPEED_1 = 0x03;  // Lowest
+static constexpr uint8_t PANASONIC_FAN_SPEED_2 = 0x04;
+static constexpr uint8_t PANASONIC_FAN_SPEED_3 = 0x05;
+static constexpr uint8_t PANASONIC_FAN_SPEED_4 = 0x06;
+static constexpr uint8_t PANASONIC_FAN_SPEED_5 = 0x07;  // Highest
+static constexpr uint8_t PANASONIC_VERTICAL_SWING = 0x0F;
 
-  if (this->supports_cool_ && this->supports_heat_)
-    traits.add_supported_mode(climate::CLIMATE_MODE_HEAT_COOL);
+// Byte 17: horizontal vane (low nibble)
+static constexpr uint8_t PANASONIC_HORIZONTAL_SWING = 0x0D;
 
-  if (this->supports_dry_)
-    traits.add_supported_mode(climate::CLIMATE_MODE_DRY);
-  if (this->supports_fan_only_)
-    traits.add_supported_mode(climate::CLIMATE_MODE_FAN_ONLY);
+// Byte 26: checksum over the second frame
+static constexpr size_t PANASONIC_CHECKSUM_START = PANASONIC_FRAME1_SIZE;
+static constexpr size_t PANASONIC_CHECKSUM_INDEX = PANASONIC_STATE_SIZE - 1;
 
-  // Default to only 3 levels in ESPHome even if most unit supports 4. The 3rd level is not used.
-  traits.set_supported_fan_modes(
-      {climate::CLIMATE_FAN_AUTO, climate::CLIMATE_FAN_LOW, climate::CLIMATE_FAN_MEDIUM, climate::CLIMATE_FAN_HIGH});
-  if (this->fan_mode_ == PANASONIC_FAN_LOWEST)
-    traits.add_supported_fan_mode(climate::CLIMATE_FAN_QUIET);
-  if (this->fan_mode_ == PANASONIC_FAN_MEDIUM)
-    traits.add_supported_fan_mode(climate::CLIMATE_FAN_MIDDLE);  // Shouldn't be used for this but it helps
+// ------------------------------------------------------------------------------
+// | Byte  | Description                                                        |
+// ------------------------------------------------------------------------------
+// | 0-7   | Constant frame 1: 0x02 0x20 0xE0 0x04 0x00 0x00 0x00 0x06          |
+// | 8-11  | Constant: 0x02 0x20 0xE0 0x04                                      |
+// | 12    | Constant: 0x00                                                     |
+// | 13    | reserved:1 | mode:3 | constant 1:1 | timer_off:1 | timer_on:1 | on:1|
+// | 14    | reserved:2 | temperature:5 | half_degree:1                         |
+// | 15    | Constant: 0x80                                                     |
+// | 16    | fan_speed:4 | vertical_vane:4                                       |
+// | 17    | reserved:4 | horizontal_vane:4                                     |
+// | 18-20 | Timers (unused), model specific constants in 19 and 20             |
+// | 21-22 | reserved: 0x00                                                     |
+// | 23    | Model specific constant                                            |
+// | 24-25 | Clock (unused)                                                     |
+// | 26    | Checksum: SUM[8..25]                                               |
+// ------------------------------------------------------------------------------
+static constexpr uint8_t PANASONIC_TEMPLATE[PANASONIC_STATE_SIZE] = {
+    0x02, 0x20, 0xE0, 0x04, 0x00, 0x00, 0x00, 0x06,  // Frame 1
+    0x02, 0x20, 0xE0, 0x04, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+};
+// Bytes of the second frame that every Panasonic AC remote sends unchanged
+static constexpr size_t PANASONIC_FIXED_BYTES = 12;
 
-  traits.set_supported_swing_modes({climate::CLIMATE_SWING_OFF, climate::CLIMATE_SWING_BOTH,
-                                    climate::CLIMATE_SWING_VERTICAL, climate::CLIMATE_SWING_HORIZONTAL});
+static uint8_t encode_mode(climate::ClimateMode mode, bool supports_heat) {
+  switch (mode) {
+    case climate::CLIMATE_MODE_HEAT:
+      return PANASONIC_MODE_HEAT;
+    case climate::CLIMATE_MODE_DRY:
+      return PANASONIC_MODE_DRY;
+    case climate::CLIMATE_MODE_COOL:
+      return PANASONIC_MODE_COOL;
+    case climate::CLIMATE_MODE_HEAT_COOL:
+      return PANASONIC_MODE_AUTO;
+    case climate::CLIMATE_MODE_FAN_ONLY:
+      return PANASONIC_MODE_FAN_ONLY;
+    case climate::CLIMATE_MODE_OFF:
+    default:
+      // The unit is switched off with the power bit; it still expects a mode
+      return supports_heat ? PANASONIC_MODE_HEAT : PANASONIC_MODE_COOL;
+  }
+}
 
-  traits.set_supported_presets({climate::CLIMATE_PRESET_NONE /*, climate::CLIMATE_PRESET_ECO*/});
+static optional<climate::ClimateMode> decode_mode(uint8_t mode) {
+  switch (mode) {
+    case PANASONIC_MODE_HEAT:
+      return climate::CLIMATE_MODE_HEAT;
+    case PANASONIC_MODE_DRY:
+      return climate::CLIMATE_MODE_DRY;
+    case PANASONIC_MODE_COOL:
+      return climate::CLIMATE_MODE_COOL;
+    case PANASONIC_MODE_AUTO:
+      return climate::CLIMATE_MODE_HEAT_COOL;
+    case PANASONIC_MODE_FAN_ONLY:
+      return climate::CLIMATE_MODE_FAN_ONLY;
+    default:
+      return {};
+  }
+}
 
-  return traits;
+uint8_t PanasonicClimate::encode_fan_speed_() const {
+  const bool five_levels = this->fan_mode_ == PANASONIC_FAN_5L;
+  switch (this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO)) {
+    case climate::CLIMATE_FAN_QUIET:
+      return PANASONIC_FAN_SPEED_1;
+    case climate::CLIMATE_FAN_LOW:
+      return PANASONIC_FAN_SPEED_2;
+    case climate::CLIMATE_FAN_MIDDLE:
+      return PANASONIC_FAN_SPEED_3;
+    case climate::CLIMATE_FAN_MEDIUM:
+      return five_levels ? PANASONIC_FAN_SPEED_4 : PANASONIC_FAN_SPEED_3;
+    case climate::CLIMATE_FAN_HIGH:
+      return PANASONIC_FAN_SPEED_5;
+    case climate::CLIMATE_FAN_AUTO:
+    default:
+      return PANASONIC_FAN_AUTO;
+  }
+}
+
+optional<climate::ClimateFanMode> PanasonicClimate::decode_fan_speed_(uint8_t speed) const {
+  const bool five_levels = this->fan_mode_ == PANASONIC_FAN_5L;
+  switch (speed) {
+    case PANASONIC_FAN_AUTO:
+      return climate::CLIMATE_FAN_AUTO;
+    case PANASONIC_FAN_SPEED_1:
+      return five_levels ? climate::CLIMATE_FAN_QUIET : climate::CLIMATE_FAN_LOW;
+    case PANASONIC_FAN_SPEED_2:
+      return climate::CLIMATE_FAN_LOW;
+    case PANASONIC_FAN_SPEED_3:
+      return five_levels ? climate::CLIMATE_FAN_MIDDLE : climate::CLIMATE_FAN_MEDIUM;
+    case PANASONIC_FAN_SPEED_4:
+      return five_levels ? climate::CLIMATE_FAN_MEDIUM : climate::CLIMATE_FAN_HIGH;
+    case PANASONIC_FAN_SPEED_5:
+      return climate::CLIMATE_FAN_HIGH;
+    default:
+      return {};
+  }
 }
 
 void PanasonicClimate::transmit_state() {
-  // ------------------------------------------------------------------------------
-  // | Byte  | Description                                                        |
-  // ------------------------------------------------------------------------------
-  // | 0     | Constant: 0x02                                                     |
-  // | 1     | Constant: 0x20                                                     |
-  // | 2     | Constant: 0xe0                                                     |
-  // | 3     | Constant: 0x04                                                     |
-  // | 4-6   | Constant: 0x00                                                     |
-  // | 7     | Constant: 0x06                                                     |
-  // | 8     | Constant: 0x02                                                     |
-  // | 9     | Constant: 0x20                                                     |
-  // | 10    | Constant: 0xe0                                                     |
-  // | 11    | Constant: 0x04                                                     |
-  // | 13    | reserved:1 | mode:3 | reserved:1 | timer_off:1 | timer_on:1 | on:1 |
-  // | 14    | reserved:2 | normal_mode:1 | temperature:4 | reserved:1            |
-  // | 15    | Constant: 0x80                                                     |
-  // | 16    | fan_speed:4 | swing_vertical:4                                     |
-  // | 17    | reserved:4 | swing_horizontal:4                                    |
-  // | 18-20 | reserved:1 | timer_minute_off:11 | reserved:1 | timer_minute_on:11 |
-  // | 21-22 | reserved: 0x00                                                     |
-  // | 23    | Constant: 0x80                                                     |
-  // | 24-25 | reserved:5 | time:11                                               |
-  // | 26    | Checksum: SUM[8..25]                                               |
-  // ------------------------------------------------------------------------------
+  uint8_t remote_state[PANASONIC_STATE_SIZE];
+  memcpy(remote_state, PANASONIC_TEMPLATE, sizeof(remote_state));
 
-  uint8_t remote_state[27] = {PANASONIC_BYTE00,
-                              PANASONIC_BYTE01,
-                              PANASONIC_BYTE02,
-                              PANASONIC_BYTE03,
-                              0x00,
-                              0x00,
-                              0x00,
-                              PANASONIC_BYTE07,
-                              PANASONIC_BYTE08,
-                              PANASONIC_BYTE09,
-                              PANASONIC_BYTE10,
-                              PANASONIC_BYTE11,
-                              0x00,
-                              0x00,
-                              0x00,
-                              PANASONIC_BYTE15,
-                              0x00,
-                              0x00,
-                              0x00,
-                              PANASONIC_BYTE19,
-                              PANASONIC_BYTE20,
-                              0x00,
-                              0x00,
-                              PANASONIC_BYTE23,
-                              0x00,
-                              0x00,
-                              0x00};
-
-  remote_state[13] = 0x01;  // Default on
-  switch (this->mode) {
-    case climate::CLIMATE_MODE_HEAT:
-      remote_state[13] |= Mode::HEAT << 4;
-      break;
-    case climate::CLIMATE_MODE_DRY:
-      remote_state[13] |= Mode::DRY << 4;
-      break;
-    case climate::CLIMATE_MODE_COOL:
-      remote_state[13] |= Mode::COOL << 4;
-      break;
-    case climate::CLIMATE_MODE_HEAT_COOL:
-      remote_state[13] |= Mode::AUTO << 4;
-      break;
-    case climate::CLIMATE_MODE_FAN_ONLY:
-      remote_state[13] |= Mode::FAN << 4;
-      break;
-    case climate::CLIMATE_MODE_OFF:
-      remote_state[13] = 0x00;  // Off
-    default:
-      if (this->supports_heat_) {
-        remote_state[13] |= Mode::HEAT << 4;
-      } else {
-        remote_state[13] |= Mode::COOL << 4;
-      }
-      break;
-  }
-  remote_state[13] |= 1 << 3;
+  // Power and mode
+  const bool supports_heat = this->modes_.count(climate::CLIMATE_MODE_HEAT) != 0;
+  remote_state[13] = (encode_mode(this->mode, supports_heat) << PANASONIC_MODE_SHIFT) | PANASONIC_BYTE13_CONSTANT;
+  if (this->mode != climate::CLIMATE_MODE_OFF)
+    remote_state[13] |= PANASONIC_POWER_ON;
 
   // Temperature
-  if (this->mode == climate::CLIMATE_MODE_DRY) {
-    remote_state[14] = ((24 - PANASONIC_TEMP_MIN) & 0x0f) << 1;
-  } else {
-    remote_state[14] =
-        ((uint8_t) roundf(clamp<float>(this->target_temperature, PANASONIC_TEMP_MIN, PANASONIC_TEMP_MAX) -
-                          PANASONIC_TEMP_MIN))
-        << 1;
+  uint8_t temperature = PANASONIC_DRY_TEMP;
+  if (this->mode != climate::CLIMATE_MODE_DRY && !std::isnan(this->target_temperature)) {
+    temperature = (uint8_t) roundf(clamp<float>(this->target_temperature, PANASONIC_TEMP_MIN, PANASONIC_TEMP_MAX));
   }
-  remote_state[14] |= 1 << 5;  // Normal mode
+  remote_state[14] = temperature << PANASONIC_TEMP_SHIFT;
 
-  // Swing
-  switch (this->swing_mode) {
-    case climate::CLIMATE_SWING_HORIZONTAL:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_DOWN;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_AUTO;
-      break;
-    case climate::CLIMATE_SWING_VERTICAL:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_AUTO;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_MIDDLE;
-      break;
-    case climate::CLIMATE_SWING_BOTH:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_AUTO;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_AUTO;
-      break;
-    case climate::CLIMATE_SWING_OFF:
-    default:
-      remote_state[16] = VerticalDirection::VERTICAL_DIRECTION_DOWN;
-      remote_state[17] = HorizontalDirection::HORIZONTAL_DIRECTION_MIDDLE;
-      break;
-  }
+  // Vanes: a swinging axis is sent as auto, a fixed one at its configured position
+  const auto swing_mode = this->swing_mode;
+  const bool swing_vertical =
+      swing_mode == climate::CLIMATE_SWING_VERTICAL || swing_mode == climate::CLIMATE_SWING_BOTH;
+  const bool swing_horizontal =
+      swing_mode == climate::CLIMATE_SWING_HORIZONTAL || swing_mode == climate::CLIMATE_SWING_BOTH;
+  remote_state[16] =
+      swing_vertical ? PANASONIC_VERTICAL_SWING : static_cast<uint8_t>(this->default_vertical_direction_);
+  remote_state[17] =
+      swing_horizontal ? PANASONIC_HORIZONTAL_SWING : static_cast<uint8_t>(this->default_horizontal_direction_);
 
-  ESP_LOGD(TAG, "default_horizontal_direction_: %02X", this->default_horizontal_direction_);
-  ESP_LOGD(TAG, "default_vertical_direction_: %02X", this->default_vertical_direction_);
+  // Fan speed
+  remote_state[16] |= this->encode_fan_speed_() << 4;
 
-  // Fan Speed
-  switch (this->fan_mode.value()) {
-    case climate::CLIMATE_FAN_QUIET:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_LOWEST << 4;
-      break;
-    case climate::CLIMATE_FAN_LOW:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_LOW << 4;
-      break;
-    case climate::CLIMATE_FAN_MEDIUM:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_MEDIUM << 4;
-      break;
-    case climate::CLIMATE_FAN_MIDDLE:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_HIGH << 4;
-      break;
-    case climate::CLIMATE_FAN_HIGH:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_HIGHEST << 4;
-      break;
-    default:
-      remote_state[16] |= SetFanMode::PANASONIC_FAN_AUTO << 4;
-      break;
-  }
+  remote_state[PANASONIC_CHECKSUM_INDEX] =
+      sum_bytes(remote_state + PANASONIC_CHECKSUM_START, PANASONIC_CHECKSUM_INDEX - PANASONIC_CHECKSUM_START);
 
-  ESP_LOGD(TAG, "fan: %02x state: %01x", this->fan_mode.value(), remote_state[16]);
-
-  // Special modes
-  switch (this->preset.value()) {
-    /*
-    case climate::CLIMATE_PRESET_ECO:
-      remote_state[6] = PANASONIC_MODE_COOL | PANASONIC_OTHERWISE;
-      remote_state[8] = (remote_state[8] & ~7) | PANASONIC_MODE_A_COOL;
-      remote_state[14] = PANASONIC_ECONOCOOL;
-      break;
-      */
-    case climate::CLIMATE_PRESET_NONE:
-    default:
-      break;
-  }
-
-  // Checksum
-  remote_state[26] = 0;
-  for (int i = 8; i < 26; i++) {
-    remote_state[26] += remote_state[i];
-  }
-
-  ESP_LOGD(TAG, "sending: %s", format_hex_pretty(remote_state, 27).c_str());
+  ESP_LOGD_HEX(TAG, remote_state, PANASONIC_STATE_SIZE, PANASONIC_STATE_SIZE, "Sending: %s");
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
-
   data->set_carrier_frequency(38000);
+  // Two headers, a mark and a space per bit, the gap and the end mark
+  data->reserve(4 + PANASONIC_STATE_SIZE * 16 + 3);
 
-  // Header 1
-  data->mark(PANASONIC_HEADER_MARK);
-  data->space(PANASONIC_HEADER_SPACE);
+  // Frame 1
+  data->item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE);
+  data->item_bytes<PANASONIC_BIT_TIMINGS>(remote_state, PANASONIC_FRAME1_SIZE);
+  data->item(PANASONIC_BIT_MARK, PANASONIC_MIN_GAP);
 
-  uint8_t p;
-  for (p = 0; p < 8; p++) {
-    uint8_t payload = remote_state[p];
-    for (uint8_t bitNo = 0; bitNo < 8; bitNo++) {
-      data->mark(PANASONIC_BIT_MARK);
-      bool bit = payload & 0x01;
-      data->space(bit ? PANASONIC_ONE_SPACE : PANASONIC_ZERO_SPACE);
-      payload >>= 1;
-    }
-  }
-  data->mark(PANASONIC_BIT_MARK);
-  data->space(PANASONIC_MIN_GAP);
-
-  // Header 2
-  data->mark(PANASONIC_HEADER_MARK);
-  data->space(PANASONIC_HEADER_SPACE);
-
-  for (; p < sizeof(remote_state); p++) {
-    uint8_t payload = remote_state[p];
-    for (uint8_t bitNo = 0; bitNo < 8; bitNo++) {
-      data->mark(PANASONIC_BIT_MARK);
-      bool bit = payload & 0x01;
-      data->space(bit ? PANASONIC_ONE_SPACE : PANASONIC_ZERO_SPACE);
-      payload >>= 1;
-    }
-  }
+  // Frame 2
+  data->item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE);
+  data->item_bytes<PANASONIC_BIT_TIMINGS>(remote_state + PANASONIC_FRAME1_SIZE, PANASONIC_FRAME2_SIZE);
   data->mark(PANASONIC_END_MARK);
 
   transmit.perform();
 }
 
-bool PanasonicClimate::parse_state_frame_(const uint8_t frame[]) { return false; }
-
 bool PanasonicClimate::on_receive(remote_base::RemoteReceiveData data) {
-  return false;
-  /*
-  uint8_t state_frame[27] = {};
+  uint8_t state[PANASONIC_STATE_SIZE];
 
-  if (!data.expect_item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE)) {
-    ESP_LOGV(TAG, "Header fail");
+  // Frame 1
+  if (!data.expect_item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE) ||
+      !data.expect_bytes<PANASONIC_BIT_TIMINGS>(state, PANASONIC_FRAME1_SIZE) ||
+      memcmp(state, PANASONIC_TEMPLATE, PANASONIC_FRAME1_SIZE) != 0) {
+    ESP_LOGV(TAG, "Frame 1 fail");
+    return false;
+  }
+  if (!data.expect_pulse_with_gap(PANASONIC_BIT_MARK, PANASONIC_MIN_GAP)) {
+    ESP_LOGV(TAG, "Gap fail");
     return false;
   }
 
-  for (uint8_t pos = 0; pos < 27; pos++) {
-    uint8_t byte = 0;
-    for (int8_t bit = 0; bit < 8; bit++) {
-      if (data.expect_item(PANASONIC_BIT_MARK, PANASONIC_ONE_SPACE)) {
-        byte |= 1 << bit;
-      } else if (!data.expect_item(PANASONIC_BIT_MARK, PANASONIC_ZERO_SPACE)) {
-        ESP_LOGV(TAG, "Byte %d bit %d fail", pos, bit);
-        return false;
-      }
-    }
-    state_frame[pos] = byte;
-
-    // Check Header && Footer
-    if ((pos == 0 && byte != PANASONIC_BYTE00) || (pos == 1 && byte != PANASONIC_BYTE01) ||
-        (pos == 2 && byte != PANASONIC_BYTE02) || (pos == 3 && byte != PANASONIC_BYTE03) ||
-        (pos == 7 && byte != PANASONIC_BYTE07) || (pos == 8 && byte != PANASONIC_BYTE08) ||
-        (pos == 9 && byte != PANASONIC_BYTE09) || (pos == 10 && byte != PANASONIC_BYTE10) ||
-        (pos == 11 && byte != PANASONIC_BYTE11) || (pos == 15 && byte != PANASONIC_BYTE15)) {
-      ESP_LOGV(TAG, "Byte %d fail - invalid value", pos);
-      return false;
-    }
+  // Frame 2
+  uint8_t *frame2 = state + PANASONIC_FRAME1_SIZE;
+  if (!data.expect_item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE) ||
+      !data.expect_bytes<PANASONIC_BIT_TIMINGS>(frame2, PANASONIC_FRAME2_SIZE) ||
+      memcmp(frame2, PANASONIC_TEMPLATE + PANASONIC_FRAME1_SIZE, PANASONIC_FIXED_BYTES - PANASONIC_FRAME1_SIZE) != 0) {
+    ESP_LOGV(TAG, "Frame 2 fail");
+    return false;
+  }
+  const uint8_t checksum =
+      sum_bytes(state + PANASONIC_CHECKSUM_START, PANASONIC_CHECKSUM_INDEX - PANASONIC_CHECKSUM_START);
+  if (checksum != state[PANASONIC_CHECKSUM_INDEX]) {
+    ESP_LOGV(TAG, "Checksum fail: expected %02X, got %02X", checksum, state[PANASONIC_CHECKSUM_INDEX]);
+    return false;
   }
 
-  // On/Off and Mode
-  if (state_frame[5] == PANASONIC_OFF) {
+  ESP_LOGV_HEX(TAG, state, PANASONIC_STATE_SIZE, PANASONIC_STATE_SIZE, "Receiving: %s");
+
+  // Power and mode; an unknown mode keeps the current one
+  if ((state[13] & PANASONIC_POWER_ON) == 0) {
     this->mode = climate::CLIMATE_MODE_OFF;
   } else {
-    switch (state_frame[6]) {
-      case PANASONIC_MODE_HEAT:
-        this->mode = climate::CLIMATE_MODE_HEAT;
-        break;
-      case PANASONIC_MODE_DRY:
-        this->mode = climate::CLIMATE_MODE_DRY;
-        break;
-      case PANASONIC_MODE_COOL:
-        this->mode = climate::CLIMATE_MODE_COOL;
-        break;
-      case PANASONIC_MODE_FAN_ONLY:
-        this->mode = climate::CLIMATE_MODE_FAN_ONLY;
-        break;
-      case PANASONIC_MODE_AUTO:
-        this->mode = climate::CLIMATE_MODE_HEAT_COOL;
-        break;
-    }
+    auto mode = decode_mode((state[13] >> PANASONIC_MODE_SHIFT) & PANASONIC_MODE_MASK);
+    if (mode.has_value())
+      this->mode = *mode;
   }
 
-  // Temp
-  this->target_temperature = state_frame[7] + PANASONIC_TEMP_MIN;
+  // Temperature
+  const uint8_t temperature = (state[14] >> PANASONIC_TEMP_SHIFT) & PANASONIC_TEMP_MASK;
+  if (temperature >= PANASONIC_TEMP_MIN && temperature <= PANASONIC_TEMP_MAX)
+    this->target_temperature = temperature;
 
-  // Fan
-  uint8_t fan = state_frame[9] & 0x07;  //(Bit 0,1,2 = Speed)
-  // Map of Climate fan mode to this device expected value
-  // For 3Level: Low = 1, Medium = 2, High = 3
-  // For 4Level: Low = 1, Middle = 2, Medium = 3, High = 4
-  // For 5Level: Low = 1, Middle = 2, Medium = 3, High = 4
-  // For 4Level + Quiet: Low = 1, Middle = 2, Medium = 3, High = 4, Quiet = 5
-  climate::ClimateFanMode modes_mapping[8] = {
-      climate::CLIMATE_FAN_AUTO,
-      climate::CLIMATE_FAN_LOW,
-      this->fan_mode_ == PANASONIC_FAN_3L ? climate::CLIMATE_FAN_MEDIUM : climate::CLIMATE_FAN_MIDDLE,
-      this->fan_mode_ == PANASONIC_FAN_3L ? climate::CLIMATE_FAN_HIGH : climate::CLIMATE_FAN_MEDIUM,
-      climate::CLIMATE_FAN_HIGH,
-      climate::CLIMATE_FAN_QUIET,
-      climate::CLIMATE_FAN_AUTO,
-      climate::CLIMATE_FAN_AUTO};
-  this->fan_mode = modes_mapping[fan];
+  // Fan speed; an unknown speed keeps the current one
+  auto fan_mode = this->decode_fan_speed_(state[16] >> 4);
+  if (fan_mode.has_value())
+    this->fan_mode = fan_mode;
 
-  // Wide Vane
-  uint8_t wide_vane = state_frame[8] & 0xF0;  // Bits 4,5,6,7
-  switch (wide_vane) {
-    case PANASONIC_WIDE_VANE_SWING:
-      this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
-      break;
-    default:
-      this->swing_mode = climate::CLIMATE_SWING_OFF;
-      break;
+  // Vanes
+  const bool swing_vertical = (state[16] & 0x0F) == PANASONIC_VERTICAL_SWING;
+  const bool swing_horizontal = (state[17] & 0x0F) == PANASONIC_HORIZONTAL_SWING;
+  if (swing_vertical && swing_horizontal) {
+    this->swing_mode = climate::CLIMATE_SWING_BOTH;
+  } else if (swing_vertical) {
+    this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
+  } else if (swing_horizontal) {
+    this->swing_mode = climate::CLIMATE_SWING_HORIZONTAL;
+  } else {
+    this->swing_mode = climate::CLIMATE_SWING_OFF;
   }
-
-  // Vertical Vane
-  uint8_t vertical_vane = state_frame[9] & 0x38;  // Bits 3,4,5
-  switch (vertical_vane) {
-    case PANASONIC_VERTICAL_VANE_SWING:
-      if (this->swing_mode == climate::CLIMATE_SWING_HORIZONTAL) {
-        this->swing_mode = climate::CLIMATE_SWING_BOTH;
-      } else {
-        this->swing_mode = climate::CLIMATE_SWING_VERTICAL;
-      }
-      break;
-  }
-
-  switch (state_frame[14]) {
-    case PANASONIC_ECONOCOOL:
-      this->preset = climate::CLIMATE_PRESET_ECO;
-      break;
-    case PANASONIC_NIGHTMODE:
-      this->preset = climate::CLIMATE_PRESET_SLEEP;
-      break;
-  }
-
-  ESP_LOGV(TAG, "Receiving: %s", format_hex_pretty(state_frame, 18).c_str());
 
   this->publish_state();
   return true;
-  */
 }
 
-}  // namespace panasonic
-}  // namespace esphome
+void PanasonicClimate::dump_config() {
+  climate_ir::ClimateIR::dump_config();
+  ESP_LOGCONFIG(TAG,
+                "  Fan speeds: %u\n"
+                "  Horizontal default: 0x%02X\n"
+                "  Vertical default: 0x%02X",
+                this->fan_mode_ == PANASONIC_FAN_5L ? 5u : 3u, this->default_horizontal_direction_,
+                this->default_vertical_direction_);
+}
+
+}  // namespace esphome::panasonic

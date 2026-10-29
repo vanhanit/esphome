@@ -1,7 +1,8 @@
 import esphome.codegen as cg
 from esphome.components import climate_ir
+from esphome.components.const import CONF_HORIZONTAL_DEFAULT, CONF_VERTICAL_DEFAULT
 import esphome.config_validation as cv
-from esphome.const import CONF_ID
+from esphome.types import ConfigType
 
 CODEOWNERS = ["@vanhanit"]
 AUTO_LOAD = ["climate_ir"]
@@ -12,55 +13,50 @@ PanasonicClimate = panasonic_ns.class_("PanasonicClimate", climate_ir.ClimateIR)
 CONF_SET_FAN_MODE = "set_fan_mode"
 SetFanMode = panasonic_ns.enum("SetFanMode")
 SETFANMODE = {
-    "quiet_4levels": SetFanMode.PANASONIC_FAN_AUTO,
-    #    "5levels": SetFanMode.PANASONIC_FAN_5L,
-    "4levels": SetFanMode.PANASONIC_FAN_AUTO,
-    "3levels": SetFanMode.PANASONIC_FAN_AUTO,
+    "3levels": SetFanMode.PANASONIC_FAN_3L,
+    "5levels": SetFanMode.PANASONIC_FAN_5L,
 }
 
 CONF_SUPPORTS_DRY = "supports_dry"
 CONF_SUPPORTS_FAN_ONLY = "supports_fan_only"
 
-CONF_HORIZONTAL_DEFAULT = "horizontal_default"
-HorizontalDirections = panasonic_ns.enum("HorizontalDirections")
-HORIZONTAL_DIRECTIONS = {
-    "left": HorizontalDirections.HORIZONTAL_DIRECTION_LEFT,
-    "middle-left": HorizontalDirections.HORIZONTAL_DIRECTION_MIDDLE_LEFT,
-    "middle": HorizontalDirections.HORIZONTAL_DIRECTION_MIDDLE,
-    "middle-right": HorizontalDirections.HORIZONTAL_DIRECTION_MIDDLE_RIGHT,
-    "right": HorizontalDirections.HORIZONTAL_DIRECTION_RIGHT,
-    "split": HorizontalDirections.HORIZONTAL_DIRECTION_SPLIT,
-}
+HorizontalDirection = panasonic_ns.enum("HorizontalDirection")
+HORIZONTAL_DIRECTIONS = HorizontalDirection.options(
+    "left",
+    "middle-left",
+    "middle",
+    "middle-right",
+    "right",
+    prefix="HORIZONTAL_DIRECTION_",
+)
 
-CONF_VERTICAL_DEFAULT = "vertical_default"
-VerticalDirections = panasonic_ns.enum("VerticalDirections")
-VERTICAL_DIRECTIONS = {
-    "auto": VerticalDirections.VERTICAL_DIRECTION_AUTO,
-    "up": VerticalDirections.VERTICAL_DIRECTION_UP,
-    "middle-up": VerticalDirections.VERTICAL_DIRECTION_MIDDLE_UP,
-    "middle": VerticalDirections.VERTICAL_DIRECTION_MIDDLE,
-    "middle-down": VerticalDirections.VERTICAL_DIRECTION_MIDDLE_DOWN,
-    "down": VerticalDirections.VERTICAL_DIRECTION_DOWN,
-}
+VerticalDirection = panasonic_ns.enum("VerticalDirection")
+VERTICAL_DIRECTIONS = VerticalDirection.options(
+    "up",
+    "middle-up",
+    "middle",
+    "middle-down",
+    "down",
+    prefix="VERTICAL_DIRECTION_",
+)
 
 
 CONFIG_SCHEMA = climate_ir.climate_ir_with_receiver_schema(PanasonicClimate).extend(
     {
-        cv.GenerateID(): cv.declare_id(PanasonicClimate),
         cv.Optional(CONF_SET_FAN_MODE, default="3levels"): cv.enum(SETFANMODE),
         cv.Optional(CONF_SUPPORTS_DRY, default=False): cv.boolean,
         cv.Optional(CONF_SUPPORTS_FAN_ONLY, default=False): cv.boolean,
         cv.Optional(CONF_HORIZONTAL_DEFAULT, default="middle"): cv.enum(
             HORIZONTAL_DIRECTIONS
         ),
-        cv.Optional(CONF_VERTICAL_DEFAULT, default="middle"): cv.enum(
+        cv.Optional(CONF_VERTICAL_DEFAULT, default="down"): cv.enum(
             VERTICAL_DIRECTIONS
         ),
     }
 )
 
 
-async def to_code(config):
+async def to_code(config: ConfigType) -> None:
     var = await climate_ir.new_climate_ir(config)
 
     cg.add(var.set_fan_mode(config[CONF_SET_FAN_MODE]))

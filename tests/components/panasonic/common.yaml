@@ -1,0 +1,13 @@
+climate:
+  - platform: panasonic
+    name: Panasonic
+    transmitter_id: xmitr
+    receiver_id: rcvr
+    supports_dry: true
+    supports_fan_only: true
+    set_fan_mode: 5levels
+    horizontal_default: middle-left
+    vertical_default: middle
+  - platform: panasonic
+    name: Panasonic Defaults
+    transmitter_id: xmitr
