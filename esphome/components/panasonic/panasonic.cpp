@@ -18,10 +18,10 @@ static constexpr size_t PANASONIC_STATE_SIZE = PANASONIC_FRAME1_SIZE + PANASONIC
 static constexpr uint16_t PANASONIC_HEADER_MARK = 3500;
 static constexpr uint16_t PANASONIC_HEADER_SPACE = 1700;
 static constexpr uint16_t PANASONIC_BIT_MARK = 400;
+static constexpr uint16_t PANASONIC_ONE_SPACE = 1350;
+static constexpr uint16_t PANASONIC_ZERO_SPACE = 430;
 static constexpr uint16_t PANASONIC_END_MARK = 550;
 static constexpr uint16_t PANASONIC_MIN_GAP = 10000;
-static constexpr remote_base::BitTimings PANASONIC_BIT_TIMINGS{
-    .bit_mark = PANASONIC_BIT_MARK, .one_space = 1350, .zero_space = 430};
 
 // Byte 13: power and mode
 static constexpr uint8_t PANASONIC_POWER_ON = 0x01;
@@ -79,6 +79,36 @@ static constexpr uint8_t PANASONIC_TEMPLATE[PANASONIC_STATE_SIZE] = {
 };
 // Bytes of the second frame that every Panasonic AC remote sends unchanged
 static constexpr size_t PANASONIC_FIXED_BYTES = 12;
+
+static uint8_t checksum(const uint8_t *state) {
+  uint8_t sum = 0;
+  for (size_t i = PANASONIC_CHECKSUM_START; i < PANASONIC_CHECKSUM_INDEX; i++)
+    sum += state[i];
+  return sum;
+}
+
+// Bits are sent least significant bit first
+static void encode_bytes(remote_base::RemoteTransmitData *data, const uint8_t *bytes, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    for (uint8_t bit = 0; bit < 8; bit++)
+      data->item(PANASONIC_BIT_MARK, (bytes[i] >> bit) & 1 ? PANASONIC_ONE_SPACE : PANASONIC_ZERO_SPACE);
+  }
+}
+
+static bool decode_bytes(remote_base::RemoteReceiveData &data, uint8_t *bytes, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    uint8_t byte = 0;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      if (data.expect_item(PANASONIC_BIT_MARK, PANASONIC_ONE_SPACE)) {
+        byte |= 1 << bit;
+      } else if (!data.expect_item(PANASONIC_BIT_MARK, PANASONIC_ZERO_SPACE)) {
+        return false;
+      }
+    }
+    bytes[i] = byte;
+  }
+  return true;
+}
 
 static uint8_t encode_mode(climate::ClimateMode mode, bool supports_heat) {
   switch (mode) {
@@ -186,10 +216,12 @@ void PanasonicClimate::transmit_state() {
   // Fan speed
   remote_state[16] |= this->encode_fan_speed_() << 4;
 
-  remote_state[PANASONIC_CHECKSUM_INDEX] =
-      sum_bytes(remote_state + PANASONIC_CHECKSUM_START, PANASONIC_CHECKSUM_INDEX - PANASONIC_CHECKSUM_START);
+  remote_state[PANASONIC_CHECKSUM_INDEX] = checksum(remote_state);
 
-  ESP_LOGD_HEX(TAG, remote_state, PANASONIC_STATE_SIZE, PANASONIC_STATE_SIZE, "Sending: %s");
+#ifdef ESPHOME_LOG_HAS_DEBUG
+  char hex[format_hex_pretty_size(PANASONIC_STATE_SIZE)];
+  ESP_LOGD(TAG, "Sending: %s", format_hex_pretty_to(hex, remote_state, PANASONIC_STATE_SIZE));
+#endif
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
@@ -199,12 +231,12 @@ void PanasonicClimate::transmit_state() {
 
   // Frame 1
   data->item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE);
-  data->item_bytes<PANASONIC_BIT_TIMINGS>(remote_state, PANASONIC_FRAME1_SIZE);
+  encode_bytes(data, remote_state, PANASONIC_FRAME1_SIZE);
   data->item(PANASONIC_BIT_MARK, PANASONIC_MIN_GAP);
 
   // Frame 2
   data->item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE);
-  data->item_bytes<PANASONIC_BIT_TIMINGS>(remote_state + PANASONIC_FRAME1_SIZE, PANASONIC_FRAME2_SIZE);
+  encode_bytes(data, remote_state + PANASONIC_FRAME1_SIZE, PANASONIC_FRAME2_SIZE);
   data->mark(PANASONIC_END_MARK);
 
   transmit.perform();
@@ -215,7 +247,7 @@ bool PanasonicClimate::on_receive(remote_base::RemoteReceiveData data) {
 
   // Frame 1
   if (!data.expect_item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE) ||
-      !data.expect_bytes<PANASONIC_BIT_TIMINGS>(state, PANASONIC_FRAME1_SIZE) ||
+      !decode_bytes(data, state, PANASONIC_FRAME1_SIZE) ||
       memcmp(state, PANASONIC_TEMPLATE, PANASONIC_FRAME1_SIZE) != 0) {
     ESP_LOGV(TAG, "Frame 1 fail");
     return false;
@@ -228,19 +260,21 @@ bool PanasonicClimate::on_receive(remote_base::RemoteReceiveData data) {
   // Frame 2
   uint8_t *frame2 = state + PANASONIC_FRAME1_SIZE;
   if (!data.expect_item(PANASONIC_HEADER_MARK, PANASONIC_HEADER_SPACE) ||
-      !data.expect_bytes<PANASONIC_BIT_TIMINGS>(frame2, PANASONIC_FRAME2_SIZE) ||
+      !decode_bytes(data, frame2, PANASONIC_FRAME2_SIZE) ||
       memcmp(frame2, PANASONIC_TEMPLATE + PANASONIC_FRAME1_SIZE, PANASONIC_FIXED_BYTES - PANASONIC_FRAME1_SIZE) != 0) {
     ESP_LOGV(TAG, "Frame 2 fail");
     return false;
   }
-  const uint8_t checksum =
-      sum_bytes(state + PANASONIC_CHECKSUM_START, PANASONIC_CHECKSUM_INDEX - PANASONIC_CHECKSUM_START);
-  if (checksum != state[PANASONIC_CHECKSUM_INDEX]) {
-    ESP_LOGV(TAG, "Checksum fail: expected %02X, got %02X", checksum, state[PANASONIC_CHECKSUM_INDEX]);
+  const uint8_t expected = checksum(state);
+  if (expected != state[PANASONIC_CHECKSUM_INDEX]) {
+    ESP_LOGV(TAG, "Checksum fail: expected %02X, got %02X", expected, state[PANASONIC_CHECKSUM_INDEX]);
     return false;
   }
 
-  ESP_LOGV_HEX(TAG, state, PANASONIC_STATE_SIZE, PANASONIC_STATE_SIZE, "Receiving: %s");
+#ifdef ESPHOME_LOG_HAS_VERBOSE
+  char hex[format_hex_pretty_size(PANASONIC_STATE_SIZE)];
+  ESP_LOGV(TAG, "Receiving: %s", format_hex_pretty_to(hex, state, PANASONIC_STATE_SIZE));
+#endif
 
   // Power and mode; an unknown mode keeps the current one
   if ((state[13] & PANASONIC_POWER_ON) == 0) {

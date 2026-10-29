@@ -1,8 +1,13 @@
 import esphome.codegen as cg
 from esphome.components import climate_ir
-from esphome.components.const import CONF_HORIZONTAL_DEFAULT, CONF_VERTICAL_DEFAULT
 import esphome.config_validation as cv
 from esphome.types import ConfigType
+
+try:
+    from esphome.components.const import CONF_HORIZONTAL_DEFAULT, CONF_VERTICAL_DEFAULT
+except ImportError:  # ESPHome 2026.10 and older, when used as an external component
+    CONF_HORIZONTAL_DEFAULT = "horizontal_default"
+    CONF_VERTICAL_DEFAULT = "vertical_default"
 
 CODEOWNERS = ["@vanhanit"]
 AUTO_LOAD = ["climate_ir"]
@@ -21,24 +26,22 @@ CONF_SUPPORTS_DRY = "supports_dry"
 CONF_SUPPORTS_FAN_ONLY = "supports_fan_only"
 
 HorizontalDirection = panasonic_ns.enum("HorizontalDirection")
-HORIZONTAL_DIRECTIONS = HorizontalDirection.options(
-    "left",
-    "middle-left",
-    "middle",
-    "middle-right",
-    "right",
-    prefix="HORIZONTAL_DIRECTION_",
-)
+HORIZONTAL_DIRECTIONS = {
+    "left": HorizontalDirection.HORIZONTAL_DIRECTION_LEFT,
+    "middle-left": HorizontalDirection.HORIZONTAL_DIRECTION_MIDDLE_LEFT,
+    "middle": HorizontalDirection.HORIZONTAL_DIRECTION_MIDDLE,
+    "middle-right": HorizontalDirection.HORIZONTAL_DIRECTION_MIDDLE_RIGHT,
+    "right": HorizontalDirection.HORIZONTAL_DIRECTION_RIGHT,
+}
 
 VerticalDirection = panasonic_ns.enum("VerticalDirection")
-VERTICAL_DIRECTIONS = VerticalDirection.options(
-    "up",
-    "middle-up",
-    "middle",
-    "middle-down",
-    "down",
-    prefix="VERTICAL_DIRECTION_",
-)
+VERTICAL_DIRECTIONS = {
+    "up": VerticalDirection.VERTICAL_DIRECTION_UP,
+    "middle-up": VerticalDirection.VERTICAL_DIRECTION_MIDDLE_UP,
+    "middle": VerticalDirection.VERTICAL_DIRECTION_MIDDLE,
+    "middle-down": VerticalDirection.VERTICAL_DIRECTION_MIDDLE_DOWN,
+    "down": VerticalDirection.VERTICAL_DIRECTION_DOWN,
+}
 
 
 CONFIG_SCHEMA = climate_ir.climate_ir_with_receiver_schema(PanasonicClimate).extend(
